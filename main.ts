@@ -3,7 +3,7 @@
 // answers, one per case and in the cases' order, byte for byte what JSON.stringify(answers) written as UTF-8 is.
 // Outside a container MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output.
 //
-// It mirrors the house driver, with two changes that leave every output byte as it was:
+// It mirrors the house driver, with three changes that leave every output byte as it was:
 //
 // 1. Each answer is serialized and written as soon as it is read, and its case is let go, so the garbage collector
 //    never has to copy or mark every answer at once.
@@ -16,17 +16,26 @@
 //    the very start of a text, is its three bytes EF BB BF here: they are cut off before run() sees the text, which
 //    is what run() does with a leading U+FEFF. Anything else (invalid UTF-8, a \u escape that is not ASCII) takes the
 //    plain UTF-8 path.
+//
+// 3. GC hygiene. Each case is answered in a function of its own, so once it returns nothing (not even a stale
+//    interpreter register of the loop) still holds its answer, and a minor GC is run right then, while the young
+//    generation holds almost nothing live: the scavenges that would otherwise land mid-case copy far less.
 
 import { isUtf8 } from 'node:buffer';
 import { closeSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 
 // V8 flags set before solve.js is imported, as the house driver does. Turbofan off: on one CPU its compile time costs
 // more than its faster code saves on inputs of this size (Maglev still optimizes).
 setFlagsFromString('--no-incremental-marking');
 setFlagsFromString('--no-turbofan');
 setFlagsFromString('--no-lazy-feedback-allocation');
+// gc(), for the minor GC between cases (change 3): exposed in a fresh context; a no-op where it is not there.
+setFlagsFromString('--expose-gc');
+const exposed = runInNewContext('typeof gc === "function" ? gc : null') as ((o: { type: string }) => void) | null;
+const minorGc = exposed ?? (() => {});
 
 const { run } = (await import(new URL('./solve.js', import.meta.url).href)) as { run: (input: unknown) => unknown };
 
@@ -49,13 +58,17 @@ const encoding = bytes ? 'latin1' : 'utf8';
 
 const fd = openSync(join(OUTPUT_DIR, 'answers.json'), 'w');
 writeSync(fd, '[');
-for (let i = 0; i < cases.length; i++) {
+function answer(i: number): void {
   let input = (cases[i] as { input: any }).input;
   cases[i] = null;
   if (bytes && input !== null && typeof input === 'object' && typeof input.text === 'string' && input.text.startsWith('\xEF\xBB\xBF')) {
     input = { text: input.text.slice(3), header: input.header };
   }
   writeSync(fd, (i === 0 ? '' : ',') + (JSON.stringify(run(input)) ?? 'null'), null, encoding);
+}
+for (let i = 0; i < cases.length; i++) {
+  answer(i);
+  minorGc({ type: 'minor' });
 }
 writeSync(fd, ']');
 closeSync(fd);

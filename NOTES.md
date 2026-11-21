@@ -79,3 +79,56 @@ Dead ends, measured and dropped:
 - Timing noise on this machine was about ±5%. The margin over the baseline is far larger than that.
 - Performance on pathological inputs: a quote that never closes scans to the end of the text, as csv-reader does.
   After the first one, any later quoted field closes within its own run of quotes, so there is no quadratic blow-up.
+
+## Speed session 2 (2026-11-22): GC hygiene in the driver
+
+### Change (main.ts only; solve.js unchanged)
+
+- Each case is now answered in a function of its own (`answer(i)`). Before, the loop at the top level of the module
+  ran in the interpreter, and a stale register still held the previous case's answer. Every scavenge during the next
+  case copied that answer again.
+- After each case, the driver forces a minor GC: `gc({type: 'minor'})`. `gc` comes from `--expose-gc`, set through
+  `setFlagsFromString` and reached via `vm.runInNewContext`. At that moment the young generation holds almost nothing
+  live, so the scavenge is cheap, and fewer scavenges land mid-case. If `gc` is unavailable, this step is a no-op:
+  it affects speed only and never the output.
+
+### Measurements (practice set, one CPU, process CPU in seconds; "before" is HEAD aa8d0b3)
+
+| method | before | after | change |
+|---|---|---|---|
+| tools/bench.sh, 15 rounds, mean (run 1) | 0.413 | 0.364 | −11.9% |
+| tools/bench.sh, 15 rounds, mean (run 2) | 0.403 | 0.362 | −10.2% |
+| tools/abtest.sh, 24 rounds, trimmed mean (2 fastest and 2 slowest dropped, as in the heat) | 0.403 | 0.356 | −11.7% |
+| tools/abtest.sh, median of per-round after/before ratio (20 and 24 rounds) | 1.000 | 0.902 | −9.8% |
+
+The baseline (csv-reader 1.0.0) took 1.674 s in the same runs, so the entry is now about 4.6x faster on total
+process CPU. The per-round paired median ratio sits just under 10%. Both bench.sh runs and the trimmed mean are
+above 10%, which meets the adoption bar (measured with the bench.sh method).
+
+Ablation from the interrupted part of the session (paired abtest, 16 rounds, ratio to the full candidate):
+- without the per-case function: +13.9% slower
+- without the minor GC: +6.9% slower
+
+Measured and dropped (no measurable gain, or slower):
+- Custom serializer joining "clean" rows: slower than native `JSON.stringify`.
+- Native `split(',')` over each quote-free stretch of fields: run slowed from 113 to 147 ms.
+- Running the driver in a Worker with large semi-space flags: worker startup (about 100 ms) outweighs the GC gain.
+- `--semi-space-growth-factor`, `--page-promotion-threshold`, and JIT tier-up flags: none measurable.
+- `indexOf`-based `unescape`, and `var` instead of `let` for module state: ratio 1.000 in the ablation.
+- Startup: about 55 ms of node's startup is TypeScript stripping of main.ts. Node does that for any `.ts` file, so it
+  cannot be avoided.
+- Not done: reading CSV directly from the escaped JSON bytes, skipping `run`. That would break the rule that
+  main.ts "answers each with run".
+
+### Verification (final code)
+
+- Practice: answers.json byte-identical to the baseline driver's. `grade-local --driver process --worktree`:
+  passed 1, 6/6, L1 regrade reproduced byte for byte.
+- Fuzzer: 2,000,000 cases on seeds never used before (3001–3008, 250k each), 0 diffs.
+- Generator: 100 full-size cases on new seeds (prefix `session3`), 0 diffs.
+- Driver level (tools/driver-diff.mjs): 40 cases.json files (30 in byte mode, 10 on the UTF-8 fallback), 0 byte
+  diffs.
+- Mutation check: 4 broken copies of solve.js, all caught by the fuzzer: 893, 5458, 1062 and 334 diffs per 20k
+  cases. The fourth mutant reintroduces the CR-at-end-of-text bug found earlier.
+- The previous attempt at this verification was cut off by an environment restart. This session redid all of it
+  on fresh seeds.
