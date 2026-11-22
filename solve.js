@@ -1,280 +1,43 @@
-// A fast reader with csv-reader 1.0.0's exact semantics: run({text, header}) -> {columns, rows, errors}.
+// csv-reader 1.0.0's reading, run({text, header}) -> {columns, rows, errors}, done by a WebAssembly transducer.
 //
-// One left-to-right pass over the text by char codes; fields are slices of the text (no per-character string
-// building), a quoted field's closing quote is found with indexOf. The work is split into small functions (a record,
-// a quoted field, the rare lone-CR path) so V8 compiles each one cheaply and once; CPU time spent compiling counts.
-// Dependency-free and pure: the module state below is scratch, reset by every call.
+// The module (built from wasm/csv.ts by wasm/build.mjs, embedded below as base64) reads a cases.json document, the
+// JSON array [{"id", "input": {"text", "header"}}, ...], and writes the JSON array of the answers in one pass, straight
+// from the JSON-escaped texts: each escape is taken for the character it stands for, and every character that is not a
+// comma, quote, CR or LF is copied to the answer exactly as it is written. run() wraps one input as such a document.
+// The driver (main.ts) hands it the whole file. Dependency-free and pure: the module's memory is scratch.
 
-// Scratch state shared by the readers within one run() call.
-let pos = 0; // the next character to read
-let line = 1; // the line that character is on
-let term = 0; // how the last field ended: 0 at a comma, 1 at a line break or the end of the text
-let added = 0; // characters readBare kept (dropped lone CRs not counted)
-let nLF = -1; // the first LF at or after some earlier point (n when none), refreshed lazily
-let nCR = -1; // likewise for CR
+const WASM = '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';
 
-function err(code, l, row) {
-  return { code, line: l, row };
+const instance = new WebAssembly.Instance(new WebAssembly.Module(Buffer.from(WASM, 'base64')), {});
+const wasm = instance.exports;
+
+/** Room for a document of `length` bytes in the module's memory: write it into the returned bytes. */
+export function prepare(length) {
+  const at = wasm.prepare(length);
+  return new Uint8Array(wasm.memory.buffer, at, length);
 }
 
-// The unquoted reader for a field holding a lone CR (or junk after a closing quote): reads from i onto `prefix` up to
-// a comma, LF, CRLF or the end, dropping each CR not followed by LF with a stray_cr error. Sets pos, term, added; a
-// line break ending the field is counted.
-function readBare(text, i, n, prefix, errors, recLine, recRow) {
-  let v = prefix;
-  let from = i;
-  let kept = 0;
-  for (;;) {
-    if (i >= n) {
-      v += text.slice(from, n);
-      kept += n - from;
-      pos = n;
-      term = 1;
-      break;
-    }
-    const c = text.charCodeAt(i);
-    if (c === 44) {
-      v += text.slice(from, i);
-      kept += i - from;
-      pos = i + 1;
-      term = 0;
-      break;
-    }
-    if (c === 10) {
-      v += text.slice(from, i);
-      kept += i - from;
-      pos = i + 1;
-      line += 1;
-      term = 1;
-      break;
-    }
-    if (c === 13) {
-      v += text.slice(from, i);
-      kept += i - from;
-      if (i + 1 < n && text.charCodeAt(i + 1) === 10) {
-        pos = i + 2;
-        line += 1;
-        term = 1;
-        break;
-      }
-      errors.push(err('stray_cr', recLine, recRow));
-      i += 1;
-      from = i;
-      continue;
-    }
-    i += 1;
+/** The answers to the prepared document as UTF-8 JSON bytes (a view of the module's memory), or null when the
+ * document is outside the shape the transducer reads (the caller then answers it the general way). */
+export function transduce() {
+  let n;
+  try {
+    n = wasm.transduce();
+  } catch {
+    return null;
   }
-  added = kept;
-  return v;
-}
-
-// A quoted field's value with "" read as one quote and CRLF or a lone CR as LF, counting its line breaks.
-function unescape(text, s, q) {
-  let v = '';
-  let from = s;
-  for (let k = s; k < q; k++) {
-    const c = text.charCodeAt(k);
-    if (c === 34) {
-      v += text.slice(from, k + 1);
-      k += 1;
-      from = k + 1;
-    } else if (c === 13) {
-      v += text.slice(from, k) + '\n';
-      line += 1;
-      if (text.charCodeAt(k + 1) === 10) k += 1;
-      from = k + 1;
-    } else if (c === 10) {
-      line += 1;
-    }
-  }
-  return v + text.slice(from, q);
-}
-
-// The field whose opening quote is at p. Sets pos and term.
-function readQuoted(text, p, n, errors, recLine, recRow) {
-  const s = p + 1;
-  let i = s;
-  let dbl = false;
-  let q;
-  for (;;) {
-    q = text.indexOf('"', i);
-    if (q < 0 || text.charCodeAt(q + 1) !== 34) break;
-    dbl = true;
-    i = q + 2;
-  }
-  if (q < 0) {
-    // It never closes: the quote is a literal character and the text after it is read again as unquoted.
-    errors.push(err('unterminated_quote', recLine, recRow));
-    return readBare(text, s, n, '"', errors, recLine, recRow);
-  }
-  if (nLF < s) {
-    nLF = text.indexOf('\n', s);
-    if (nLF < 0) nLF = n;
-  }
-  if (nCR < s) {
-    nCR = text.indexOf('\r', s);
-    if (nCR < 0) nCR = n;
-  }
-  let v = !dbl && nLF > q && nCR > q ? text.slice(s, q) : unescape(text, s, q);
-  i = q + 1;
-  if (i >= n) {
-    pos = n;
-    term = 1;
-    return v;
-  }
-  const c = text.charCodeAt(i);
-  if (c === 44) {
-    pos = i + 1;
-    term = 0;
-    return v;
-  }
-  if (c === 10) {
-    pos = i + 1;
-    line += 1;
-    term = 1;
-    return v;
-  }
-  if (c === 13 && text.charCodeAt(i + 1) === 10) {
-    pos = i + 2;
-    line += 1;
-    term = 1;
-    return v;
-  }
-  // What follows the closing quote, up to the next comma or line break, is appended as it stands.
-  v = readBare(text, i, n, v, errors, recLine, recRow);
-  if (added > 0) errors.push(err('quote_junk', recLine, recRow));
-  return v;
-}
-
-// One record starting at pos (not at an empty line). Returns its fields; `quotedLast` tells whether its last field
-// opened with a quote.
-let quotedLast = false;
-let nC = -1; // the first comma at or after some earlier point (n when none)
-function readRecord(text, n, errors, recLine, recRow) {
-  const fields = [];
-  let p = pos;
-  for (;;) {
-    if (text.charCodeAt(p) === 34) {
-      fields.push(readQuoted(text, p, n, errors, recLine, recRow));
-      p = pos;
-      if (term === 0) continue;
-      quotedLast = true;
-      return fields;
-    }
-    if (nC < p) {
-      nC = text.indexOf(',', p);
-      if (nC < 0) nC = n;
-    }
-    if (nLF < p) {
-      nLF = text.indexOf('\n', p);
-      if (nLF < 0) nLF = n;
-    }
-    if (nCR < p) {
-      nCR = text.indexOf('\r', p);
-      if (nCR < 0) nCR = n;
-    }
-    if (nC < nLF && nC < nCR) {
-      fields.push(text.slice(p, nC));
-      p = nC + 1;
-      continue;
-    }
-    if (nCR < nLF) {
-      // A CR before the field ends at a comma or LF.
-      if (nCR + 1 === nLF && nLF < n) {
-        fields.push(text.slice(p, nCR));
-        pos = nLF + 1;
-        line += 1;
-        break;
-      }
-      fields.push(readBare(text, nCR, n, text.slice(p, nCR), errors, recLine, recRow));
-      p = pos;
-      if (term === 0) continue;
-      break;
-    }
-    if (nLF < n) {
-      fields.push(text.slice(p, nLF));
-      pos = nLF + 1;
-      line += 1;
-      break;
-    }
-    fields.push(text.slice(p, n));
-    pos = n;
-    break;
-  }
-  quotedLast = false;
-  return fields;
-}
-
-function shortRow(l, row, count) {
-  return { code: 'short_row', line: l, row, fields: count };
-}
-
-function longRow(l, row, extra) {
-  return { code: 'long_row', line: l, row, extra };
+  if (n < 0) return null;
+  return new Uint8Array(wasm.memory.buffer, wasm.outStart(), n);
 }
 
 /** csv-reader 1.0.0's reading of {text, header}: {columns, rows, errors}. */
 export function run(input) {
   const text = String(input.text);
   const header = input.header === true;
-  const n = text.length;
-  const rows = [];
-  const errors = [];
-  let columns = null;
-  let width = -1;
-  let wantHeader = header;
-  pos = n > 0 && text.charCodeAt(0) === 0xfeff ? 1 : 0;
-  line = 1;
-  nLF = -1;
-  nCR = -1;
-  nC = -1;
-
-  for (;;) {
-    // Lines with no characters (LF or CRLF) are no records.
-    let p = pos;
-    while (p < n) {
-      const c = text.charCodeAt(p);
-      if (c === 10) {
-        p += 1;
-        line += 1;
-      } else if (c === 13 && text.charCodeAt(p + 1) === 10) {
-        p += 2;
-        line += 1;
-      } else break;
-    }
-    if (p >= n) break;
-    pos = p;
-
-    const recLine = line;
-    const recRow = wantHeader ? null : rows.length;
-    const fields = readRecord(text, n, errors, recLine, recRow);
-    const len = fields.length;
-    // A line left with no characters (it held only lone CRs) is no record; its stray_cr errors stay.
-    if (len === 1 && !quotedLast && fields[0] === '') continue;
-
-    if (width < 0) width = len;
-    if (wantHeader) {
-      columns = fields;
-      wantHeader = false;
-      continue;
-    }
-    if (len < width) {
-      errors.push(shortRow(recLine, recRow, len));
-      for (let k = len; k < width; k++) fields.push('');
-    } else if (len > width) {
-      errors.push(longRow(recLine, recRow, fields.splice(width)));
-    }
-    rows.push(fields);
-  }
-  return { columns: header ? (columns ?? []) : null, rows, errors };
+  // JSON.stringify escapes lone surrogates, so the UTF-8 bytes carry every code unit of the text.
+  const doc = Buffer.from('[{"input":{"text":' + JSON.stringify(text) + ',"header":' + header + '}}]', 'utf8');
+  prepare(doc.length).set(doc);
+  const out = transduce();
+  if (out === null) throw new Error('transducer refused its own document');
+  return JSON.parse(Buffer.from(out.buffer, out.byteOffset, out.length).toString('utf8'))[0];
 }
-
-// Warm-up: readings of small texts that take every branch, so the optimizing compiler sees complete type feedback and
-// does not deoptimize and recompile midway through a large input. Their results are dropped.
-const WARM = [
-  '﻿a,b,c\n1,2,3\r\n\n\r\n"q""x","y\r\nz\rw\nv",p\n"j"kg,"k"\r\n',
-  'x,y\n1,2\r3\n\r\r\n"a"\rb,"c"\r,d\n1\n1,2,3,4\n"open,1\n2,"x"',
-  'hé,東\n"",\n"a"\n"z",q',
-  '',
-];
-for (let r = 0; r < 12; r++) for (let i = 0; i < WARM.length; i++) run({ text: WARM[i], header: (r + i) % 2 === 0 });
