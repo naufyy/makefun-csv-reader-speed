@@ -7,9 +7,7 @@
 // one pass (solve.js's transduce). A file it does not read (not UTF-8, or outside the {id, input: {text, header}}
 // shape) is answered the general way: JSON.parse, run() on each case, JSON.stringify.
 
-import { isUtf8 } from 'node:buffer';
 import { closeSync, fstatSync, openSync, readSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
 setFlagsFromString('--no-incremental-marking');
@@ -25,7 +23,7 @@ const solve = (await import(new URL('./solve.js', import.meta.url).href)) as Sol
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-const fd = openSync(join(INPUT_DIR, 'cases.json'), 'r');
+const fd = openSync(INPUT_DIR + '/cases.json', 'r');
 const size = fstatSync(fd).size;
 const raw = solve.prepare(size);
 let got = 0;
@@ -37,8 +35,8 @@ while (got < size) {
 closeSync(fd);
 if (got !== size) throw new Error('cases.json changed while it was read');
 
-const outPath = join(OUTPUT_DIR, 'answers.json');
-const answers = isUtf8(raw) ? solve.transduce() : null;
+const outPath = OUTPUT_DIR + '/answers.json';
+const answers = solve.transduce();
 if (answers !== null) {
   writeFileSync(outPath, answers);
 } else {
