@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
 setFlagsFromString('--no-incremental-marking');
+setFlagsFromString('--liftoff-only');
 
 type Solve = {
   run: (input: unknown) => unknown;
